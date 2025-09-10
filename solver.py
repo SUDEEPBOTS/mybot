@@ -1,6 +1,7 @@
 import re
 import unicodedata
 from collections import Counter, defaultdict
+from typing import List, Tuple, Dict
 
 EMOJI_GREEN = "🟩"
 EMOJI_YELLOW = "🟨"
@@ -40,8 +41,8 @@ def strip_to_ascii_letters(word: str) -> str:
 
 def parse_line(line: str):
     s = normalize_text(line).strip()
-    if not s: return None
-
+    if not s:
+        return None
     m = re.match(rf"^([{EMOJI_GREEN}{EMOJI_YELLOW}{EMOJI_GRAY}\s]{{5,}})\s+([A-Za-z\s]{{3,}})$", s)
     if m:
         tiles_raw, word_raw = m.group(1), m.group(2)
@@ -53,7 +54,6 @@ def parse_line(line: str):
         if len(word) != 5:
             return None
         return (word, fb)
-
     toks = s.split()
     if len(toks) >= 2:
         patt, last = toks, toks[-1]
@@ -64,7 +64,7 @@ def parse_line(line: str):
     if len(toks) >= 6:
         flags = [t.upper() for t in toks[:5]]
         if all(t in VALID_FB for t in flags):
-            w = strip_to_ascii_letters(toks[13])
+            w = strip_to_ascii_letters(toks[4])
             if len(w) == 5:
                 return (w, "".join(flags))
     return None
@@ -79,11 +79,11 @@ def extract_guess_pairs_from_text(text: str):
         raise ValueError("No valid guess lines found. Use emojis+word, 'GYBBY WORD', or 'G Y B B Y WORD'.")
     return pairs
 
-def accumulate_constraints(guesses):
-    greens = {}
-    yellows_not_pos = defaultdict(set)
+def accumulate_constraints(guesses: List[Tuple[str, str]]):
+    greens: Dict[int, str] = {}
+    yellows_not_pos: Dict[str, set] = defaultdict(set)
     global_min = Counter()
-    global_max_known = {}
+    global_max_known: Dict[str, int] = {}
 
     for word, fb in guesses:
         gy_counts = Counter()
@@ -120,7 +120,7 @@ def word_satisfies(word, greens, yellows_not_pos, min_counts, max_counts):
         if wc[l] > mx: return False
     return True
 
-def positional_frequencies(words):
+def positional_frequencies(words: List[str]):
     pos_freq = [Counter() for _ in range(5)]
     global_freq = Counter()
     for w in words:
@@ -129,7 +129,7 @@ def positional_frequencies(words):
             global_freq[ch] += 1
     return pos_freq, global_freq
 
-def intelligent_scores(cands):
+def intelligent_scores(cands: List[str]):
     pos_freq, global_freq = positional_frequencies(cands)
     vowels = set("aeiou")
     scores = {}
@@ -176,16 +176,26 @@ def yellow_patterns_lines(yellows_not_pos):
     return lines if lines else ["Yellow pattern: —"]
 
 class WordleSolver:
-    def __init__(self, words):
+    def __init__(self, words: List[str]):
         self.words = [w for w in words if len(w)==5 and w.isalpha() and w.islower()]
 
+    @staticmethod
+    def sanitize_word_list(raw_lines: List[str]) -> List[str]:
+        out = []
+        for ln in raw_lines:
+            s = strip_to_ascii_letters(ln)
+            if len(s) == 5:
+                out.append(s)
+        return out
+
     @classmethod
-    def from_file(cls, path):
+    def from_file(cls, path: str):
         with open(path, "r", encoding="utf-8") as f:
-            words = [ln.strip() for ln in f if ln.strip()]
+            raw = [ln.strip() for ln in f if ln.strip()]
+        words = cls.sanitize_word_list(raw)
         return cls(words)
 
-    def solve(self, guesses):
+    def solve(self, guesses: List[Tuple[str, str]]):
         greens, yellows_not_pos, min_counts, max_counts = accumulate_constraints(guesses)
         cands = [w for w in self.words if word_satisfies(w, greens, yellows_not_pos, min_counts, max_counts)]
         return {
@@ -196,19 +206,19 @@ class WordleSolver:
             "candidates": cands,
         }
 
-    def rank_words(self, words):
+    def rank_words(self, words: List[str]):
         if not words: return []
         scores = intelligent_scores(words)
         items = [(w, scores[w]) for w in words]
         return sorted(items, key=lambda x: (-x, x))
 
-def visualize_guess_line(word, fb):
+def visualize_guess_line(word: str, fb: str):
     tags = []
     for i, (ch, f) in enumerate(zip(word.upper(), fb), 1):
         tags.append(f"{i}:{ch}({f})")
     return " - " + " ".join(tags)
 
-def build_constraints_report(pairs):
+def build_constraints_report(pairs: List[Tuple[str, str]]):
     greens, ynp, minc, maxc = accumulate_constraints(pairs)
     g_line = "Greens: " + (", ".join([f"{i+1}:{ch}" for i, ch in sorted(greens.items())]) or "-")
     y_lines = []
@@ -237,13 +247,13 @@ def build_constraints_report(pairs):
     gray_line = "Gray-only letters: " + (", ".join(grays).upper() if grays else "-")
     return "\n".join([g_line, y_block, min_line, max_line, allowed_block, gray_line])
 
-def build_pattern_string(result):
+def build_pattern_string(result) -> str:
     patt = ["_"] * 5
     for i, ch in result["greens"].items():
         patt[i] = ch
     return " ".join(patt)
 
-def deduce_grays_display(pairs):
+def deduce_grays_display(pairs: List[Tuple[str, str]]) -> str:
     seen_g_y, seen_b = set(), set()
     for w, fb in pairs:
         for ch, f in zip(w, fb):
@@ -251,4 +261,4 @@ def deduce_grays_display(pairs):
             elif f == "B": seen_b.add(ch)
     grays = sorted([ch for ch in seen_b if ch not in seen_g_y])
     return ", ".join(grays) if grays else "-"
-                             
+                   
