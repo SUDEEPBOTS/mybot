@@ -1,4 +1,4 @@
-import os, re, pathlib
+import os, re, pathlib, asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 from telegram.constants import ParseMode
@@ -23,9 +23,9 @@ SESSION = {}
 PAGE_SIZE = 10
 
 HELP = (
-    "Reply to guesses with .db (solve) | /.gn (greens) | /.yl (yellows) | /.find PATTERN | /inf (diagnostics).\n"
+    "Reply to guesses with .db (solve) | /.gn (greens) | /.yl (yellows) | /.find PATTERN | /chack | /inf (diagnostics).\n"
     "Formats: 🟩🟨🟥🟥🟨 HEART | GYBBY CRANE | G Y B B Y AUDIO\n"
-    "Commands: .db /.gn /.yl /.find  /db /gn /yl /find /inf /wstats /top /reload /help"
+    "Commands: .db /.gn /.yl /.find /.chack  /db /gn /yl /find /chack /inf /wstats /top /reload /help"
 )
 
 def build_keyboard(best_word: str, page: int, has_next: bool, has_prev: bool):
@@ -79,7 +79,7 @@ async def wstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(mdev_escape(f"wstats error: {e}"), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ranked = solver.rank_words(solver.words)[:20]            # input list[str], output list[(w,score)]
+    ranked = solver.rank_words(solver.words)[:20]
     lines = "\n".join(f"{i+1}. {w} ({sc})" for i, (w, sc) in enumerate(ranked))
     await update.message.reply_text(mdev_escape("Top starters:\n" + lines), parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -145,6 +145,34 @@ def render_find_list(items, page, title):
     head = f"{title} (page {page+1})"
     return head + "\n" + body, has_next, has_prev
 
+def make_find_mode_keyboard():
+    rows = [[
+        InlineKeyboardButton("🧠 Smart find", callback_data="findmode:smart"),
+        InlineKeyboardButton("🔎 Find words (normal)", callback_data="findmode:normal"),
+    ]]
+    return InlineKeyboardMarkup(rows)
+
+def render_ranked_list(ranked_items: list[tuple], page: int, title: str):
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, len(ranked_items))
+    view = ranked_items[start:end]
+    body = "\n".join(f"{i+1}. {w} ({sc})" for i, (w, sc) in enumerate(view, start=start))
+    head = f"{title} (page {page+1})"
+    has_next = end < len(ranked_items)
+    has_prev = start > 0
+    return head + "\n" + body, has_next, has_prev
+
+def make_find_keyboard_with_ns(page: int, has_next: bool, has_prev: bool, mode_tag: str):
+    rows = []
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"findpg:{mode_tag}:{page-1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"findpg:{mode_tag}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows) if rows else None
+
 def parse_pattern_or_letter(args: list[str]) -> tuple[str, str]:
     if not args: return ("", "")
     raw = " ".join(args).strip().lower()
@@ -186,7 +214,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await scan.edit_text(mdev_escape("done"), parse_mode=ParseMode.MARKDOWN_V2)
 
         result = solver.solve(pairs)
-        cands = result["candidates"]                      # list[str]
+        cands = result["candidates"]
         greens_map = result["greens"]
         yellows_np = result["yellows_not_pos"]
 
@@ -212,7 +240,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await quoted_send(chat, msg, src)
             return
 
-        ranked = solver.rank_words(cands)                 # list[(w,score)]
+        ranked = solver.rank_words(cands)
         best = ranked
         pattern = build_pattern_string(result)
         greens = ", ".join([f"{i+1}:{ch}" for i, ch in sorted(greens_map.items())]) or "-"
@@ -220,7 +248,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         minc = ", ".join([f"{l}:{v}" for l, v in sorted(result["min_counts"].items())]) or "-"
         maxc = ", ".join([f"{l}:{v}" for l, v in sorted(result["max_counts"].items())]) or "-"
         grays = deduce_grays_display(pairs)
-        strict_matches = pattern_matches_strict(greens_map, yellows_np, cands)  # list[str]
+        strict_matches = pattern_matches_strict(greens_map, yellows_np, cands)
 
         page = 0
         total = len(ranked)
@@ -315,15 +343,11 @@ async def yl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await quoted_send(chat, f"Parse error: {e}", src)
 
-def parse_pattern_or_letter_args(args):
-    return parse_pattern_or_letter(args)
-
 async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update)
     chat = update.effective_chat
     src = update.message.reply_to_message if update.message else None
 
-    # optional yellows for pattern mode
     yellows_np = {}
     if src and src.text:
         try:
@@ -337,21 +361,103 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usage = "Usage:\n/.find s t o _ _\n/.find sto__\n/.find l  (letter mode)"
         await quoted_send(chat, usage, src); return
 
-    if mode == "letter":
-        items = [w for w, _ in solver.rank_words(filter_by_letter(value, solver.words))]  # list[str]
-        title = f"Words containing '{value}'"
-    else:
-        matches = filter_by_pattern_and_yellows(value, yellows_np, solver.words)         # list[str]
-        ranked = solver.rank_words(matches)                                               # list[(w,score)]
-        items = [w for w, _ in ranked] if ranked else []                                  # list[str]
-        title = f"Pattern {value} (+yellow bans)"
+    title = f"Letter query: '{value}'" if mode == "letter" else f"Pattern query: {value}"
+    sent = await quoted_send(chat, f"Choose find mode for: {title}", src)
+    SESSION[(sent.chat_id, sent.message_id)] = {
+        "mode": "find-choose",
+        "query_type": mode,
+        "query_value": value,
+        "yellows_np": yellows_np,
+        "src_msg_id": src.message_id if src else None,
+        "title": title
+    }
+    await sent.edit_reply_markup(make_find_mode_keyboard())
 
-    page = 0
-    text, has_next, has_prev = render_find_list(items, page, title)
-    sent = await quoted_send(chat, text, src)
-    SESSION[(sent.chat_id, sent.message_id)] = {"mode":"find", "items": items, "page": page, "title": title}
-    if has_next or has_prev:
-        await sent.edit_reply_markup(make_find_keyboard(page, has_next, has_prev))
+async def chack_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update)
+    chat = update.effective_chat
+    src = update.message.reply_to_message if update.message else None
+
+    greens_map = {}
+    yellows_np = {}
+    if src and src.text:
+        try:
+            pairs = extract_guess_pairs_from_text(src.text)
+            greens_map, yellows_np, _, _ = accumulate_constraints(pairs)
+        except:
+            greens_map, yellows_np = {}, {}
+
+    qmode, qvalue = parse_pattern_or_letter(context.args)
+    progress = await chat.send_message(mdev_escape("1…"), parse_mode=ParseMode.MARKDOWN_V2)
+
+    async def progress_loop(msg):
+        dots = 1
+        try:
+            while True:
+                dots = (dots % 10) + 1
+                txt = "".join(str(i) + "…" for i in range(1, dots+1))
+                await asyncio.sleep(0.25)
+                try:
+                    await msg.edit_text(mdev_escape(txt), parse_mode=ParseMode.MARKDOWN_V2)
+                except:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    loop_task = asyncio.create_task(progress_loop(progress))
+
+    try:
+        if qmode == "letter":
+            base = filter_by_letter(qvalue, solver.words)
+            ranked = solver.rank_words(base)
+            title = f"Smart matches for letter '{qvalue}'"
+        elif qmode == "pattern":
+            base = filter_by_pattern_and_yellows(qvalue, yellows_np, solver.words)
+            ranked = solver.rank_words(base)
+            title = f"Smart matches for pattern {qvalue}"
+        else:
+            if greens_map or yellows_np:
+                base = pattern_matches_strict(greens_map, yellows_np, solver.words)
+                ranked = solver.rank_words(base)
+                title = "Smart matches from replied constraints"
+            else:
+                ranked = solver.rank_words(solver.words)[:200]
+                title = "Smart matches (global top 200)"
+
+        loop_task.cancel()
+        try:
+            await loop_task
+        except:
+            pass
+        try:
+            await progress.edit_text(mdev_escape("done ✅"), parse_mode=ParseMode.MARKDOWN_V2)
+        except:
+            pass
+
+        if not ranked:
+            final_txt = title + "\n" + "No matches."
+        else:
+            topn = ranked[:20]
+            body = "\n".join(f"{i+1}. {w} ({sc})" for i, (w, sc) in enumerate(topn))
+            final_txt = title + "\n" + body
+
+        await quoted_send(chat, final_txt, src)
+        try:
+            await progress.delete()
+        except:
+            pass
+
+    except Exception as e:
+        loop_task.cancel()
+        try:
+            await loop_task
+        except:
+            pass
+        try:
+            await progress.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
+        except:
+            pass
+        await quoted_send(chat, f"Parse error: {e}", src)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -360,7 +466,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = (q.message.chat_id, q.message.message_id)
     state = SESSION.get(key)
 
-    if data.startswith("copy:"):
+if data.startswith("copy:"):
         parts = data.split(":", 1)
         if len(parts) == 2 and parts:
             await q.answer()
@@ -371,9 +477,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("pg:") and state:
         try: page = int(data.split(":", 1))
         except: await q.answer("Invalid page"); return
-        ranked = state["ranked"]                                        # list[(w,score)]
-        best = state["best"]
-        total = len(ranked)
+        ranked = state["ranked"]; best = state["best"]; total = len(ranked)
         start = max(0, page * PAGE_SIZE); end = min(start + PAGE_SIZE, total)
         if start >= total: await q.answer("No more pages"); return
         state["page"] = page
@@ -384,22 +488,79 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   reply_markup=build_keyboard(best, page, end < total, page > 0))
         await q.answer(); return
 
+    if data.startswith("findmode:"):
+        _, chosen = data.split(":", 1)
+        state = SESSION.get((q.message.chat_id, q.message.message_id))
+        if not state or state.get("mode") != "find-choose":
+            await q.answer("Session expired"); return
+        qtype = state["query_type"]
+        qvalue = state["query_value"]
+        yellows_np = state.get("yellows_np", {})
+        title = state.get("title", "Find results")
+
+if qtype == "letter":
+            base = filter_by_letter(qvalue, solver.words)
+            if chosen == "smart":
+                ranked = solver.rank_words(base)
+                state["find_smart_ranked"] = ranked
+                page = 0
+                text, has_next, has_prev = render_ranked_list(ranked, page, f"Smart find — {title}")
+                kb = make_find_keyboard_with_ns(page, has_next, has_prev, "smart")
+                await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+                state["mode"] = "find-smart"; state["page"] = page
+            else:
+                items = sorted(base)
+                state["find_normal_items"] = items
+                page = 0
+                text, has_next, has_prev = render_find_list(items, page, f"Find words — {title}")
+                kb = make_find_keyboard_with_ns(page, has_next, has_prev, "normal")
+                await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+                state["mode"] = "find-normal"; state["page"] = page
+        else:
+            base = filter_by_pattern_and_yellows(qvalue, yellows_np, solver.words)
+            if chosen == "smart":
+                ranked = solver.rank_words(base)
+                state["find_smart_ranked"] = ranked
+                page = 0
+                text, has_next, has_prev = render_ranked_list(ranked, page, f"Smart find — {title}")
+                kb = make_find_keyboard_with_ns(page, has_next, has_prev, "smart")
+                await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+                state["mode"] = "find-smart"; state["page"] = page
+            else:
+                items = sorted(base)
+                state["find_normal_items"] = items
+                page = 0
+                text, has_next, has_prev = render_find_list(items, page, f"Find words — {title}")
+                kb = make_find_keyboard_with_ns(page, has_next, has_prev, "normal")
+                await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+                state["mode"] = "find-normal"; state["page"] = page
+        await q.answer(); return
+
     if data.startswith("findpg:"):
-        try: page = int(data.split(":", 1))
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await q.answer("Bad page"); return
+        _, mode_tag, page_str = parts
+        try: page = int(page_str)
         except: await q.answer("Invalid page"); return
         st = SESSION.get((q.message.chat_id, q.message.message_id))
-        if not st or st.get("mode") != "find":
+        if not st or not st.get("mode", "").startswith("find-"):
             await q.answer("Session expired"); return
-        items = st["items"]
-        if items and isinstance(items, tuple):
-            items = [w for w, _ in items]
-            st["items"] = items
-        title = st["title"]
-        text, has_next, has_prev = render_find_list(items, page, title)
-        await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2,
-                                  reply_markup=make_find_keyboard(page, has_next, has_prev))
-        st["page"] = page
-        await q.answer(); return
+        title = st.get("title", "Find results")
+        if mode_tag == "smart" and st["mode"] == "find-smart":
+            ranked = st.get("find_smart_ranked", [])
+            text, has_next, has_prev = render_ranked_list(ranked, page, f"Smart find — {title}")
+            kb = make_find_keyboard_with_ns(page, has_next, has_prev, "smart")
+            await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+            st["page"] = page; await q.answer(); return
+        if mode_tag == "normal" and st["mode"] == "find-normal":
+            items = st.get("find_normal_items", [])
+            if items and isinstance(items, tuple):
+                items = [w for w, _ in items]; st["find_normal_items"] = items
+            text, has_next, has_prev = render_find_list(items, page, f"Find words — {title}")
+            kb = make_find_keyboard_with_ns(page, has_next, has_prev, "normal")
+            await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+            st["page"] = page; await q.answer(); return
 
     if data == "refresh" and state:
         page = state["page"]; ranked = state["ranked"]; best = state["best"]; total = len(ranked)
@@ -413,6 +574,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.answer()
 
+async def find_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await find_cmd(update, context)
+
+async def chack_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await chack_cmd(update, context)
+
 def main():
     global solver
     if not TOKEN:
@@ -422,7 +589,6 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Slash commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
@@ -433,9 +599,9 @@ def main():
     app.add_handler(CommandHandler("db", dot_db_cmd))
     app.add_handler(CommandHandler("gn", gn_cmd))
     app.add_handler(CommandHandler("yl", yl_cmd))
-    app.add_handler(CommandHandler("find", find_cmd))
+    app.add_handler(CommandHandler("find", find_entry))
+    app.add_handler(CommandHandler("chack", chack_entry))
 
-    # Dot triggers
     async def dot_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
@@ -450,8 +616,12 @@ def main():
             parts = t.split()
             context.args = parts[1:] if len(parts) > 1 else []
             await find_cmd(update, context)
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), dot_router))
+        elif t.startswith(".chack"):
+            parts = t.split()
+            context.args = parts[1:] if len(parts) > 1 else []
+            await chack_cmd(update, context)
 
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), dot_router))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.run_polling(drop_pending_updates=True, poll_interval=0.5)
 
