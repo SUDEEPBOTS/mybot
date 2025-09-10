@@ -1,6 +1,6 @@
-import os
+import os, re
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, TextQuote
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -8,7 +8,8 @@ from telegram.ext import (
 from solver import (
     WordleSolver, extract_guess_pairs_from_text, visualize_guess_line,
     build_constraints_report, build_pattern_string, deduce_grays_display,
-    mdev_escape, allowed_letters_by_position, green_patterns_lines
+    mdev_escape, allowed_letters_by_position, green_patterns_lines, yellow_patterns_lines,
+    accumulate_constraints
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -18,13 +19,13 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 WORDLIST_PATH = os.environ.get("WORDLIST_PATH", "words.txt")
 
 solver = None
-SESSION = {}  # (chat_id, message_id) -> {'ranked': [(w,score)], 'page': int, 'best': str}
+SESSION = {}
 PAGE_SIZE = 10
 
 HELP = (
-    "Reply to guesses with .db (solve) or /inf (diagnostics).\n"
+    "Reply to guesses with .db (solve), /.gn (greens), /.yl (yellows), /.find PATTERN, /inf (diagnostics).\n"
     "Formats: 🟩🟨🟥🟥🟨 HEART | GYBBY CRANE | G Y B B Y AUDIO\n"
-    "Commands: .db  /inf  /db  /info  /top  /reload  /help"
+    "Commands: .db /.gn /.yl /.find  /db /gn /yl /find /inf /top /reload /help"
 )
 
 def build_keyboard(best_word: str, page: int, has_next: bool, has_prev: bool):
@@ -47,7 +48,36 @@ async def safe_delete_message(update: Update):
         if update.effective_message:
             await update.effective_message.delete()
     except Exception:
-        pass  # ignore if lack rights or too old
+        pass  # needs admin can_delete_messages, 48h window, etc. [22][23]
+
+def build_quote_params(src_msg, quote_text: str | None = None):
+    """
+    Prefer native quoting via ReplyParameters/TextQuote (PTB v20.8+). If src_msg not available,
+    caller can fallback to MarkdownV2 blockquote.
+    """
+    if not src_msg:
+        return None
+    try:
+        qp = ReplyParameters(
+            message_id=src_msg.message_id,
+            quote=quote_text or "",   # Telegram renders quoted segment
+            quote_parse_mode="MarkdownV2"
+        )
+        return qp
+    except Exception:
+        return None
+
+async def reply_with_quote(chat, text, src_msg=None):
+    # Try native quote first; fallback to MarkdownV2 > style
+    qp = build_quote_params(src_msg, None)
+    if qp:
+        return await chat.send_message(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_parameters=qp)
+    # Fallback: prepend > for visual quote
+    quoted = ""
+    if src_msg and src_msg.text:
+        first_line = src_msg.text.splitlines()[:120]
+        quoted = f"> {mdev_escape(first_line)}\n"
+    return await chat.send_message(quoted + mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mdev_escape("WordSeek Solver ready.\n" + HELP), parse_mode=ParseMode.MARKDOWN_V2)
@@ -73,77 +103,77 @@ def build_allowed_grid_hint(result):
         lines.append(f"  {i+1}: {col}")
     return "\n".join(lines)
 
-def pattern_matches_from_wordlist(pattern_str: str, candidates: list[str]) -> list[str]:
-    """
-    Given a pattern like 'S T O _ _' produce regex and filter candidates.
-    Only underscores are wildcards; fixed letters must match in place.
-    """
-    parts = pattern_str.split()
-    if len(parts) != 5:
-        return []
-    regex = ""
-    for p in parts:
-        if p == "_" or p == "__" or p == "___":
-            regex += "."
-        else:
-            regex += re.escape(p.lower())
-    rx = re.compile("^" + regex + "$")
-    return [w for w in candidates if rx.match(w)]
+def pattern_matches_strict(greens: dict, yellows_not_pos: dict, wordlist: list[str]) -> list[str]:
+    out = []
+    for w in wordlist:
+        ok = True
+        for i, ch in greens.items():
+            if w[i] != ch:
+                ok = False; break
+        if not ok: continue
+        for ch, banned in yellows_not_pos.items():
+            if ch not in w:
+                ok = False; break
+            for pos in banned:
+                if w[pos] == ch:
+                    ok = False; break
+            if not ok: break
+        if ok:
+            out.append(w)
+    return out
+
+def format_matches(words: list[str], limit=20) -> str:
+    return ", ".join(words[:limit]) if words else "-"
 
 async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # auto-delete user's .db trigger for clean GC UX
     await safe_delete_message(update)
+    chat = update.effective_chat
+    src = update.message.reply_to_message if update.message else None
+    if not src or not src.text:
+        await reply_with_quote(chat, "Reply to a guesses message with .db", src); return
 
-    if not update.message or not update.message.reply_to_message:
-        await update.effective_chat.send_message(mdev_escape("Reply to a guesses message with .db"), parse_mode=ParseMode.MARKDOWN_V2)
-        return
-    text = (update.message.reply_to_message.text or "").strip()
-    if not text:
-        await update.effective_chat.send_message(mdev_escape("Replied message has no text."), parse_mode=ParseMode.MARKDOWN_V2)
-        return
-
-    scan = await update.effective_chat.send_message(mdev_escape("scanning ..."), parse_mode=ParseMode.MARKDOWN_V2)
+    scan = await chat.send_message(mdev_escape("scanning ..."), parse_mode=ParseMode.MARKDOWN_V2)
     try:
         await scan.edit_text(mdev_escape("wait ..."), parse_mode=ParseMode.MARKDOWN_V2)
-        pairs = extract_guess_pairs_from_text(text)
+        pairs = extract_guess_pairs_from_text(src.text)
         await scan.edit_text(mdev_escape("done"), parse_mode=ParseMode.MARKDOWN_V2)
 
         result = solver.solve(pairs)
         cands = result["candidates"]
+        greens_map = result["greens"]
+        yellows_np = result["yellows_not_pos"]
+
         if not cands:
-            greens = ", ".join([f"{i+1}:{ch}" for i, ch in sorted(result['greens'].items())]) or "-"
+            greens = ", ".join([f"{i+1}:{ch}" for i, ch in sorted(greens_map.items())]) or "-"
             must_have = ", ".join([f"{l}:{v}" for l, v in sorted(result["min_counts"].items())]) or "-"
-            bans = []
-            for ch, pos in sorted(result["yellows_not_pos"].items()):
-                bans.append(f"{ch}!@{','.join(str(i+1) for i in sorted(pos))}")
-            bans_line = ", ".join(bans) or "-"
+            bans = ", ".join(f"{ch}!@{','.join(str(i+1) for i in sorted(pos))}" for ch, pos in sorted(yellows_np.items())) or "-"
             allowed_grid = build_allowed_grid_hint(result)
-            green_lines = "\n".join(green_patterns_lines(result["greens"]))
-            # Pattern matches from entire word list using green pattern
-            pattern = build_pattern_string(result)
-            all_matches = pattern_matches_from_wordlist(pattern, solver.words)
-            show = ", ".join(all_matches[:20]) if all_matches else "-"
+            green_lines = "\n".join(green_patterns_lines(greens_map))
+            yellow_lines = "\n".join(yellow_patterns_lines(yellows_np))
+            strict_matches = pattern_matches_strict(greens_map, yellows_np, solver.words)
             msg = (
                 "No candidates. Check inputs or wordlist.\n"
                 "Pattern hints:\n"
                 f"• Greens: {greens}\n"
                 f"• Must-have counts: {must_have}\n"
-                f"• Yellow bans: {bans_line}\n"
+                f"• Yellow bans: {bans}\n"
                 f"• Allowed letters per position:\n{allowed_grid}\n"
                 f"{green_lines}\n"
-                f"Pattern matches from words.txt (top 20): {show}"
+                f"{yellow_lines}\n"
+                f"Pattern matches from words.txt (greens+yellow bans, top 20): {format_matches(strict_matches)}"
             )
-            await update.effective_chat.send_message(mdev_escape(msg), parse_mode=ParseMode.MARKDOWN_V2)
+            await reply_with_quote(chat, msg, src)
             return
 
         ranked = solver.rank_words(cands)
         best = ranked
         pattern = build_pattern_string(result)
-        greens = ", ".join([f"{i+1}:{ch}" for i, ch in sorted(result['greens'].items())]) or "-"
-        yellows = ", ".join([f"{ch} !@ {','.join(str(i+1) for i in sorted(pos))}" for ch, pos in sorted(result['yellows_not_pos'].items())]) or "-"
+        greens = ", ".join([f"{i+1}:{ch}" for i, ch in sorted(greens_map.items())]) or "-"
+        yellows = ", ".join([f"{ch} !@ {','.join(str(i+1) for i in sorted(pos))}" for ch, pos in sorted(yellows_np.items())]) or "-"
         minc = ", ".join([f"{l}:{v}" for l, v in sorted(result["min_counts"].items())]) or "-"
         maxc = ", ".join([f"{l}:{v}" for l, v in sorted(result["max_counts"].items())]) or "-"
         grays = deduce_grays_display(pairs)
+        strict_matches = pattern_matches_strict(greens_map, yellows_np, cands)
 
         page = 0
         total = len(ranked)
@@ -160,86 +190,149 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Remaining: {total}\n"
             f"👉 Suggestions: {', '.join(w for w, _ in ranked[:3])}\n"
             f"🎯 Best Answer: `{best}`\n"
-            f"Top suggestions \\(page {page+1}\\):\n{top_list}"
+            f"Top suggestions \\(page {page+1}\\):\n{top_list}\n"
+            f"Pattern matches \\(greens+yellow bans\\): {format_matches(strict_matches)}"
         )
-        sent = await update.effective_chat.send_message(
-            mdev_escape(msg), parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=build_keyboard(best, page, end < total, page > 0)
-        )
+        sent = await reply_with_quote(chat, msg, src)
         SESSION[(sent.chat_id, sent.message_id)] = {"ranked": ranked, "page": page, "best": best}
     except Exception as e:
+        try: await scan.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
+        except: pass
+        await reply_with_quote(chat, f"Parse error: {e}", src)
+
+async def gn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update)
+    chat = update.effective_chat
+    src = update.message.reply_to_message if update.message else None
+    if not src or not src.text:
+        await reply_with_quote(chat, "Reply to guesses with /.gn", src); return
+    try:
+        pairs = extract_guess_pairs_from_text(src.text)
+        greens_map, _, _, _ = accumulate_constraints(pairs)
+        greens_section = "Greens:\n" + ("\n".join(f"{ch.upper()} → position {i+1}" for i, ch in sorted(greens_map.items())) if greens_map else "—")
+        green_lines = "\n".join(green_patterns_lines(greens_map))
+        await reply_with_quote(chat, greens_section + "\n" + green_lines, src)
+    except Exception as e:
+        await reply_with_quote(chat, f"Parse error: {e}", src)
+
+async def yl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update)
+    chat = update.effective_chat
+    src = update.message.reply_to_message if update.message else None
+    if not src or not src.text:
+        await reply_with_quote(chat, "Reply to guesses with /.yl", src); return
+    try:
+        pairs = extract_guess_pairs_from_text(src.text)
+        _, yellows_np, _, _ = accumulate_constraints(pairs)
+        yellow_lines = "\n".join(yellow_patterns_lines(yellows_np))
+        await reply_with_quote(chat, yellow_lines, src)
+    except Exception as e:
+        await reply_with_quote(chat, f"Parse error: {e}", src)
+
+def parse_pattern_arg(args: list[str]) -> str:
+    if not args:
+        return ""
+    raw = " ".join(args).strip()
+    if " " in raw:
+        parts = raw.split()
+        if len(parts) == 5:
+            return " ".join(p.lower() for p in parts)
+        return ""
+    if len(raw) == 5:
+        return " ".join(ch.lower() for ch in raw)
+    return ""
+
+def filter_by_pattern_and_yellows(pattern_str: str, yellows_np: dict, wordlist: list[str]) -> list[str]:
+    parts = pattern_str.split()
+    if len(parts) != 5:
+        return []
+    greens = {i: p for i, p in enumerate(parts) if p != "_"}
+    return pattern_matches_strict(greens, yellows_np, wordlist)
+
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update)
+    chat = update.effective_chat
+    src = update.message.reply_to_message if update.message else None
+
+    yellows_np = {}
+    if src and src.text:
         try:
-            await scan.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
+            pairs = extract_guess_pairs_from_text(src.text)
+            _, yellows_np, _, _ = accumulate_constraints(pairs)
         except:
-            pass
-        await update.effective_chat.send_message(mdev_escape(f"Parse error: {e}"), parse_mode=ParseMode.MARKDOWN_V2)
+            yellows_np = {}
+
+    pattern_str = parse_pattern_arg(context.args)
+    if not pattern_str:
+        await reply_with_quote(chat, "Usage: /.find s t o _ _  OR  /.find sto__", src)
+        return
+
+    matches = filter_by_pattern_and_yellows(pattern_str, yellows_np, solver.words)
+    ranked = solver.rank_words(matches)[:3]
+    if ranked:
+        best3 = ", ".join(w for w, _ in ranked)
+        await reply_with_quote(chat, f"Matches (top 3): {best3}", src)
+    else:
+        await reply_with_quote(chat, "No matches.", src)
 
 async def inf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # auto-delete user /inf command if possible
     await safe_delete_message(update)
+    chat = update.effective_chat
+    src = update.message.reply_to_message if update.message else None
+    if not src or not src.text:
+        await reply_with_quote(chat, "Reply to a guesses message with /inf", src); return
 
-    if not update.message or not update.message.reply_to_message:
-        await update.effective_chat.send_message(mdev_escape("Reply to a guesses message with /inf"), parse_mode=ParseMode.MARKDOWN_V2)
-        return
-    text = (update.message.reply_to_message.text or "").strip()
-    if not text:
-        await update.effective_chat.send_message(mdev_escape("Replied message has no text."), parse_mode=ParseMode.MARKDOWN_V2)
-        return
-
-    step = await update.effective_chat.send_message(mdev_escape("scanning ..."), parse_mode=ParseMode.MARKDOWN_V2)
+    step = await chat.send_message(mdev_escape("scanning ..."), parse_mode=ParseMode.MARKDOWN_V2)
     try:
         await step.edit_text(mdev_escape("wait ..."), parse_mode=ParseMode.MARKDOWN_V2)
-        pairs = extract_guess_pairs_from_text(text)
+        pairs = extract_guess_pairs_from_text(src.text)
         await step.edit_text(mdev_escape("done"), parse_mode=ParseMode.MARKDOWN_V2)
 
         viz = "\n".join(visualize_guess_line(w, fb) for (w, fb) in pairs)
         report = build_constraints_report(pairs)
-        greens = solver.solve(pairs)["greens"]
-        green_lines = "\n".join(green_patterns_lines(greens))
-
-        greens_human_lines = []
-        for i, ch in sorted(greens.items()):
-            greens_human_lines.append(f"{ch.upper()} → position {i+1} (green)")
-        greens_human = "\n".join(greens_human_lines) if greens_human_lines else "—"
-
+        greens_map, yellows_np, _, _ = accumulate_constraints(pairs)
+        green_lines = "\n".join(green_patterns_lines(greens_map))
+        yellow_lines = "\n".join(yellow_patterns_lines(yellows_np))
+        greens_section = "Greens:\n" + ("\n".join(f"{ch.upper()} → position {i+1}" for i, ch in sorted(greens_map.items())) if greens_map else "—")
+        yellows_section = "Yellows (banned positions):\n" + (
+            "\n".join(f"{ch.upper()} → not at {', '.join(str(i+1) for i in sorted(pos))}" for ch, pos in sorted(yellows_np.items()))
+            if yellows_np else "—"
+        )
+        strict_matches = pattern_matches_strict(greens_map, yellows_np, solver.words)
         final = (
             "Info:\nPer-guess breakdown:\n" + viz + "\n\n" +
             report + "\n\n" +
-            "From above analysis:\n" + greens_human + "\n\n" +
-            green_lines
+            greens_section + "\n" +
+            yellows_section + "\n\n" +
+            green_lines + "\n" +
+            yellow_lines + "\n" +
+            "Matches from words.txt (greens+yellow bans): " + format_matches(strict_matches)
         )
-        await update.effective_chat.send_message(mdev_escape(final), parse_mode=ParseMode.MARKDOWN_V2)
+        await reply_with_quote(chat, final, src)
     except Exception as e:
-        try:
-            await step.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
-        except:
-            pass
-        await update.effective_chat.send_message(mdev_escape(f"Parse error: {e}"), parse_mode=ParseMode.MARKDOWN_V2)
+        try: await step.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
+        except: pass
+        await reply_with_quote(chat, f"Parse error: {e}", src)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
+    if not q: return
     data = q.data or ""
     key = (q.message.chat_id, q.message.message_id)
     state = SESSION.get(key)
     if data.startswith("copy:"):
         parts = data.split(":", 1)
         if len(parts) == 2 and parts:
-            word = parts
             await q.answer()
-            await q.message.reply_text(mdev_escape(f"`{word}`"), parse_mode=ParseMode.MARKDOWN_V2)
+            await q.message.reply_text(mdev_escape(f"`{parts}`"), parse_mode=ParseMode.MARKDOWN_V2)
             return
         await q.answer("Bad data"); return
     if data.startswith("pg:") and state:
-        try:
-            page = int(data.split(":", 1))
-        except:
-            await q.answer("Invalid page"); return
+        try: page = int(data.split(":", 1))
+        except: await q.answer("Invalid page"); return
         ranked = state["ranked"]; best = state["best"]; total = len(ranked)
         start = max(0, page * PAGE_SIZE); end = min(start + PAGE_SIZE, total)
-        if start >= total:
-            await q.answer("No more pages"); return
+        if start >= total: await q.answer("No more pages"); return
         state["page"] = page
         top_list = "\n".join(f"{i+1}. {w} ({sc})" for i, (w, sc) in enumerate(ranked[start:end], start=start))
         text = q.message.text or ""
@@ -266,7 +359,7 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Valid slash commands
+    # Slash commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
@@ -274,19 +367,29 @@ def main():
     app.add_handler(CommandHandler("inf", inf_cmd))
     app.add_handler(CommandHandler("info", inf_cmd))
     app.add_handler(CommandHandler("db", dot_db_cmd))
+    app.add_handler(CommandHandler("gn", gn_cmd))
+    app.add_handler(CommandHandler("yl", yl_cmd))
+    app.add_handler(CommandHandler("find", find_cmd))
 
-    # Dot trigger as plain text
+    # Dot triggers
     async def dot_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
-        if update.message.text.strip() == ".db":
+        t = update.message.text.strip()
+        if t == ".db":
             await dot_db_cmd(update, context)
+        elif t == ".gn":
+            await gn_cmd(update, context)
+        elif t == ".yl":
+            await yl_cmd(update, context)
+        elif t.startswith(".find"):
+            context.args = t.split()[1:] if len(t.split()) > 1 else []
+            await find_cmd(update, context)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), dot_router))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.run_polling(drop_pending_updates=True, poll_interval=0.5)
 
 if __name__ == "__main__":
-    import re  # used in pattern_matches_from_wordlist
     main()
     
