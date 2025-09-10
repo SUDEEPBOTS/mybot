@@ -42,7 +42,6 @@ def strip_to_ascii_letters(word: str) -> str:
 def parse_line(line: str):
     s = normalize_text(line).strip()
     if not s: return None
-    # Emoji tiles + word
     m = re.match(rf"^([{EMOJI_GREEN}{EMOJI_YELLOW}{EMOJI_GRAY}\s]{{5,}})\s+([A-Za-z\s]{{3,}})$", s)
     if m:
         tiles_raw, word_raw = m.group(1), m.group(2)
@@ -54,7 +53,6 @@ def parse_line(line: str):
         if len(word) != 5:
             return None
         return (word, fb)
-    # Shorthand
     toks = s.split()
     if len(toks) >= 2:
         patt, last = toks, toks[-1]
@@ -62,7 +60,6 @@ def parse_line(line: str):
             w = strip_to_ascii_letters(last)
             if len(w) == 5:
                 return (w, patt.upper())
-    # Spaced flags
     if len(toks) >= 6:
         flags = [t.upper() for t in toks[:5]]
         if all(t in VALID_FB for t in flags):
@@ -94,7 +91,6 @@ def accumulate_constraints(guesses: List[Tuple[str, str]]):
                 greens[i] = ch; gy_counts[ch] += 1
             elif fl == "Y":
                 yellows_not_pos[ch].add(i); gy_counts[ch] += 1
-        # per-guess max
         per_guess_max = {}
         gc = Counter(word)
         for l, k in gc.items():
@@ -264,4 +260,4 @@ def deduce_grays_display(pairs: List[Tuple[str, str]]) -> str:
             elif f == "B": seen_b.add(ch)
     grays = sorted([ch for ch in seen_b if ch not in seen_g_y])
     return ", ".join(grays) if grays else "-"
-                   
+    
