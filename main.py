@@ -18,7 +18,7 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 WORDLIST_PATH = os.environ.get("WORDLIST_PATH", "words.txt")
 
 solver = None
-SESSION = {}
+SESSION = {}  # (chat_id, message_id) -> {'ranked': [(w,score)], 'page': int, 'best': str}
 PAGE_SIZE = 10
 
 HELP = (
@@ -43,13 +43,11 @@ def build_keyboard(best_word: str, page: int, has_next: bool, has_prev: bool):
     return InlineKeyboardMarkup(buttons)
 
 async def safe_delete_message(update: Update):
-    # Delete the user's command message (needs admin permission with can_delete_messages)
     try:
         if update.effective_message:
             await update.effective_message.delete()
-    except Exception as e:
-        # ignore if bot lacks rights or too old etc.
-        pass
+    except Exception:
+        pass  # ignore if lack rights or too old
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mdev_escape("WordSeek Solver ready.\n" + HELP), parse_mode=ParseMode.MARKDOWN_V2)
@@ -68,15 +66,32 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mdev_escape("Top starters:\n" + lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 def build_allowed_grid_hint(result):
-    allowed = allowed_letters_by_position(result["greens"], result["yellows_not_pos"])
+    allowed = allowed_letters_by_position(result["greens"], result["yellows_not_pos"], result["min_counts"], result["max_counts"])
     lines = []
     for i in range(5):
         col = "".join(sorted(allowed[i])) if allowed[i] else "-"
         lines.append(f"  {i+1}: {col}")
     return "\n".join(lines)
 
+def pattern_matches_from_wordlist(pattern_str: str, candidates: list[str]) -> list[str]:
+    """
+    Given a pattern like 'S T O _ _' produce regex and filter candidates.
+    Only underscores are wildcards; fixed letters must match in place.
+    """
+    parts = pattern_str.split()
+    if len(parts) != 5:
+        return []
+    regex = ""
+    for p in parts:
+        if p == "_" or p == "__" or p == "___":
+            regex += "."
+        else:
+            regex += re.escape(p.lower())
+    rx = re.compile("^" + regex + "$")
+    return [w for w in candidates if rx.match(w)]
+
 async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # delete user trigger message asap
+    # auto-delete user's .db trigger for clean GC UX
     await safe_delete_message(update)
 
     if not update.message or not update.message.reply_to_message:
@@ -104,6 +119,10 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bans_line = ", ".join(bans) or "-"
             allowed_grid = build_allowed_grid_hint(result)
             green_lines = "\n".join(green_patterns_lines(result["greens"]))
+            # Pattern matches from entire word list using green pattern
+            pattern = build_pattern_string(result)
+            all_matches = pattern_matches_from_wordlist(pattern, solver.words)
+            show = ", ".join(all_matches[:20]) if all_matches else "-"
             msg = (
                 "No candidates. Check inputs or wordlist.\n"
                 "Pattern hints:\n"
@@ -111,7 +130,8 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Must-have counts: {must_have}\n"
                 f"• Yellow bans: {bans_line}\n"
                 f"• Allowed letters per position:\n{allowed_grid}\n"
-                f"{green_lines}"
+                f"{green_lines}\n"
+                f"Pattern matches from words.txt (top 20): {show}"
             )
             await update.effective_chat.send_message(mdev_escape(msg), parse_mode=ParseMode.MARKDOWN_V2)
             return
@@ -155,7 +175,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_chat.send_message(mdev_escape(f"Parse error: {e}"), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def inf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # delete user trigger message
+    # auto-delete user /inf command if possible
     await safe_delete_message(update)
 
     if not update.message or not update.message.reply_to_message:
@@ -177,7 +197,6 @@ async def inf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         greens = solver.solve(pairs)["greens"]
         green_lines = "\n".join(green_patterns_lines(greens))
 
-        # Add “From above analysis” human lines for greens
         greens_human_lines = []
         for i, ch in sorted(greens.items()):
             greens_human_lines.append(f"{ch.upper()} → position {i+1} (green)")
@@ -205,13 +224,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = (q.message.chat_id, q.message.message_id)
     state = SESSION.get(key)
     if data.startswith("copy:"):
-        word = data.split(":", 1)[20]
-        await q.answer()
-        await q.message.reply_text(mdev_escape(f"`{word}`"), parse_mode=ParseMode.MARKDOWN_V2)
-        return
+        parts = data.split(":", 1)
+        if len(parts) == 2 and parts:
+            word = parts
+            await q.answer()
+            await q.message.reply_text(mdev_escape(f"`{word}`"), parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        await q.answer("Bad data"); return
     if data.startswith("pg:") and state:
         try:
-            page = int(data.split(":", 1)[20])
+            page = int(data.split(":", 1))
         except:
             await q.answer("Invalid page"); return
         ranked = state["ranked"]; best = state["best"]; total = len(ranked)
@@ -241,16 +263,17 @@ def main():
     if not TOKEN:
         raise SystemExit("Set BOT_TOKEN")
     solver = WordleSolver.from_file(WORDLIST_PATH)
+
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Slash commands
+    # Valid slash commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
-    app.add_handler(CommandHandler("inf", inf_cmd))     # requested
-    app.add_handler(CommandHandler("info", inf_cmd))    # alias
-    app.add_handler(CommandHandler("db", dot_db_cmd))   # alias
+    app.add_handler(CommandHandler("inf", inf_cmd))
+    app.add_handler(CommandHandler("info", inf_cmd))
+    app.add_handler(CommandHandler("db", dot_db_cmd))
 
     # Dot trigger as plain text
     async def dot_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -264,5 +287,6 @@ def main():
     app.run_polling(drop_pending_updates=True, poll_interval=0.5)
 
 if __name__ == "__main__":
+    import re  # used in pattern_matches_from_wordlist
     main()
     
