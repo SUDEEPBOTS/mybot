@@ -1,6 +1,6 @@
-import os, re
+import os, re, pathlib
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, TextQuote
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -16,16 +16,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("wordseek-ui-bot")
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-WORDLIST_PATH = os.environ.get("WORDLIST_PATH", "words.txt")
+WORDLIST_PATH = os.environ.get("WORDLIST_PATH", "words.txt").strip()
 
 solver = None
 SESSION = {}
 PAGE_SIZE = 10
 
 HELP = (
-    "Reply to guesses with .db (solve), /.gn (greens), /.yl (yellows), /.find PATTERN, /inf (diagnostics).\n"
+    "Reply to guesses with .db (solve) | /.gn (greens) | /.yl (yellows) | /.find PATTERN | /inf (diagnostics).\n"
     "Formats: 🟩🟨🟥🟥🟨 HEART | GYBBY CRANE | G Y B B Y AUDIO\n"
-    "Commands: .db /.gn /.yl /.find  /db /gn /yl /find /inf /top /reload /help"
+    "Commands: .db /.gn /.yl /.find  /db /gn /yl /find /inf /wstats /top /reload /help"
 )
 
 def build_keyboard(best_word: str, page: int, has_next: bool, has_prev: bool):
@@ -48,36 +48,12 @@ async def safe_delete_message(update: Update):
         if update.effective_message:
             await update.effective_message.delete()
     except Exception:
-        pass  # needs admin can_delete_messages, 48h window, etc. [22][23]
+        pass
 
-def build_quote_params(src_msg, quote_text: str | None = None):
-    """
-    Prefer native quoting via ReplyParameters/TextQuote (PTB v20.8+). If src_msg not available,
-    caller can fallback to MarkdownV2 blockquote.
-    """
-    if not src_msg:
-        return None
-    try:
-        qp = ReplyParameters(
-            message_id=src_msg.message_id,
-            quote=quote_text or "",   # Telegram renders quoted segment
-            quote_parse_mode="MarkdownV2"
-        )
-        return qp
-    except Exception:
-        return None
-
-async def reply_with_quote(chat, text, src_msg=None):
-    # Try native quote first; fallback to MarkdownV2 > style
-    qp = build_quote_params(src_msg, None)
-    if qp:
-        return await chat.send_message(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_parameters=qp)
-    # Fallback: prepend > for visual quote
-    quoted = ""
-    if src_msg and src_msg.text:
-        first_line = src_msg.text.splitlines()[:120]
-        quoted = f"> {mdev_escape(first_line)}\n"
-    return await chat.send_message(quoted + mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2)
+def abs_path(p: str) -> str:
+    if os.path.isabs(p):
+        return p
+    return str((pathlib.Path(__file__).parent / p).resolve())
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mdev_escape("WordSeek Solver ready.\n" + HELP), parse_mode=ParseMode.MARKDOWN_V2)
@@ -87,8 +63,25 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global solver
-    solver = WordleSolver.from_file(WORDLIST_PATH)
-    await update.message.reply_text(mdev_escape(f"Reloaded {len(solver.words)} words."), parse_mode=ParseMode.MARKDOWN_V2)
+    path = abs_path(WORDLIST_PATH)
+    try:
+        solver = WordleSolver.from_file(path)
+        await update.message.reply_text(mdev_escape(f"Reloaded {len(solver.words)} words from {path}."), parse_mode=ParseMode.MARKDOWN_V2)
+    except FileNotFoundError:
+        await update.message.reply_text(mdev_escape(f"words.txt not found at {path}"), parse_mode=ParseMode.MARKDOWN_V2)
+
+async def wstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Diagnostic: show total words and 5-letter coverage vs raw lines
+    path = abs_path(WORDLIST_PATH)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = [ln.strip() for ln in f if ln.strip()]
+        from solver import WordleSolver as WS
+        sanitized = WS.sanitize_word_list(raw)
+        msg = f"File: {path}\nRaw lines: {len(raw)}\n5-letter sanitized: {len(sanitized)}\nLoaded in solver: {len(solver.words) if solver else 0}"
+        await update.message.reply_text(mdev_escape(msg), parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e:
+        await update.message.reply_text(mdev_escape(f"wstats error: {e}"), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ranked = solver.rank_words(solver.words)[:20]
@@ -125,12 +118,21 @@ def pattern_matches_strict(greens: dict, yellows_not_pos: dict, wordlist: list[s
 def format_matches(words: list[str], limit=20) -> str:
     return ", ".join(words[:limit]) if words else "-"
 
+async def quoted_send(chat, text, src_msg=None):
+    rp = None
+    if src_msg:
+        try:
+            rp = ReplyParameters(message_id=src_msg.message_id, quote_parse_mode="MarkdownV2")
+        except Exception:
+            rp = None
+    return await chat.send_message(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_parameters=rp)
+
 async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update)
     chat = update.effective_chat
     src = update.message.reply_to_message if update.message else None
     if not src or not src.text:
-        await reply_with_quote(chat, "Reply to a guesses message with .db", src); return
+        await quoted_send(chat, "Reply to a guesses message with .db", src); return
 
     scan = await chat.send_message(mdev_escape("scanning ..."), parse_mode=ParseMode.MARKDOWN_V2)
     try:
@@ -162,7 +164,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{yellow_lines}\n"
                 f"Pattern matches from words.txt (greens+yellow bans, top 20): {format_matches(strict_matches)}"
             )
-            await reply_with_quote(chat, msg, src)
+            await quoted_send(chat, msg, src)
             return
 
         ranked = solver.rank_words(cands)
@@ -193,45 +195,83 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Top suggestions \\(page {page+1}\\):\n{top_list}\n"
             f"Pattern matches \\(greens+yellow bans\\): {format_matches(strict_matches)}"
         )
-        sent = await reply_with_quote(chat, msg, src)
+        sent = await quoted_send(chat, msg, src)
         SESSION[(sent.chat_id, sent.message_id)] = {"ranked": ranked, "page": page, "best": best}
     except Exception as e:
         try: await scan.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
         except: pass
-        await reply_with_quote(chat, f"Parse error: {e}", src)
+        await quoted_send(chat, f"Parse error: {e}", src)
+
+async def inf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update)
+    chat = update.effective_chat
+    src = update.message.reply_to_message if update.message else None
+    if not src or not src.text:
+        await quoted_send(chat, "Reply to a guesses message with /inf", src); return
+
+    step = await chat.send_message(mdev_escape("scanning ..."), parse_mode=ParseMode.MARKDOWN_V2)
+    try:
+        await step.edit_text(mdev_escape("wait ..."), parse_mode=ParseMode.MARKDOWN_V2)
+        pairs = extract_guess_pairs_from_text(src.text)
+        await step.edit_text(mdev_escape("done"), parse_mode=ParseMode.MARKDOWN_V2)
+
+        viz = "\n".join(visualize_guess_line(w, fb) for (w, fb) in pairs)
+        report = build_constraints_report(pairs)
+        greens_map, yellows_np, _, _ = accumulate_constraints(pairs)
+        green_lines = "\n".join(green_patterns_lines(greens_map))
+        yellow_lines = "\n".join(yellow_patterns_lines(yellows_np))
+        greens_section = "Greens:\n" + ("\n".join(f"{ch.upper()} → position {i+1}" for i, ch in sorted(greens_map.items())) if greens_map else "—")
+        yellows_section = "Yellows (banned positions):\n" + (
+            "\n".join(f"{ch.upper()} → not at {', '.join(str(i+1) for i in sorted(pos))}" for ch, pos in sorted(yellows_np.items()))
+            if yellows_np else "—"
+        )
+        strict_matches = pattern_matches_strict(greens_map, yellows_np, solver.words)
+        final = (
+            "Info:\nPer-guess breakdown:\n" + viz + "\n\n" +
+            report + "\n\n" +
+            greens_section + "\n" +
+            yellows_section + "\n\n" +
+            green_lines + "\n" +
+            yellow_lines + "\n" +
+            "Matches from words.txt (greens+yellow bans): " + format_matches(strict_matches)
+        )
+        await quoted_send(chat, final, src)
+    except Exception as e:
+        try: await step.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
+        except: pass
+        await quoted_send(chat, f"Parse error: {e}", src)
 
 async def gn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update)
     chat = update.effective_chat
     src = update.message.reply_to_message if update.message else None
     if not src or not src.text:
-        await reply_with_quote(chat, "Reply to guesses with /.gn", src); return
+        await quoted_send(chat, "Reply to guesses with /.gn", src); return
     try:
         pairs = extract_guess_pairs_from_text(src.text)
         greens_map, _, _, _ = accumulate_constraints(pairs)
         greens_section = "Greens:\n" + ("\n".join(f"{ch.upper()} → position {i+1}" for i, ch in sorted(greens_map.items())) if greens_map else "—")
         green_lines = "\n".join(green_patterns_lines(greens_map))
-        await reply_with_quote(chat, greens_section + "\n" + green_lines, src)
+        await quoted_send(chat, greens_section + "\n" + green_lines, src)
     except Exception as e:
-        await reply_with_quote(chat, f"Parse error: {e}", src)
+        await quoted_send(chat, f"Parse error: {e}", src)
 
 async def yl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update)
     chat = update.effective_chat
     src = update.message.reply_to_message if update.message else None
     if not src or not src.text:
-        await reply_with_quote(chat, "Reply to guesses with /.yl", src); return
+        await quoted_send(chat, "Reply to guesses with /.yl", src); return
     try:
         pairs = extract_guess_pairs_from_text(src.text)
         _, yellows_np, _, _ = accumulate_constraints(pairs)
         yellow_lines = "\n".join(yellow_patterns_lines(yellows_np))
-        await reply_with_quote(chat, yellow_lines, src)
+        await quoted_send(chat, yellow_lines, src)
     except Exception as e:
-        await reply_with_quote(chat, f"Parse error: {e}", src)
+        await quoted_send(chat, f"Parse error: {e}", src)
 
 def parse_pattern_arg(args: list[str]) -> str:
-    if not args:
-        return ""
+    if not args: return ""
     raw = " ".join(args).strip()
     if " " in raw:
         parts = raw.split()
@@ -264,55 +304,15 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pattern_str = parse_pattern_arg(context.args)
     if not pattern_str:
-        await reply_with_quote(chat, "Usage: /.find s t o _ _  OR  /.find sto__", src)
-        return
+        await quoted_send(chat, "Usage: /.find s t o _ _  OR  /.find sto__", src); return
 
     matches = filter_by_pattern_and_yellows(pattern_str, yellows_np, solver.words)
     ranked = solver.rank_words(matches)[:3]
     if ranked:
         best3 = ", ".join(w for w, _ in ranked)
-        await reply_with_quote(chat, f"Matches (top 3): {best3}", src)
+        await quoted_send(chat, f"Matches (top 3): {best3}", src)
     else:
-        await reply_with_quote(chat, "No matches.", src)
-
-async def inf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_delete_message(update)
-    chat = update.effective_chat
-    src = update.message.reply_to_message if update.message else None
-    if not src or not src.text:
-        await reply_with_quote(chat, "Reply to a guesses message with /inf", src); return
-
-    step = await chat.send_message(mdev_escape("scanning ..."), parse_mode=ParseMode.MARKDOWN_V2)
-    try:
-        await step.edit_text(mdev_escape("wait ..."), parse_mode=ParseMode.MARKDOWN_V2)
-        pairs = extract_guess_pairs_from_text(src.text)
-        await step.edit_text(mdev_escape("done"), parse_mode=ParseMode.MARKDOWN_V2)
-
-        viz = "\n".join(visualize_guess_line(w, fb) for (w, fb) in pairs)
-        report = build_constraints_report(pairs)
-        greens_map, yellows_np, _, _ = accumulate_constraints(pairs)
-        green_lines = "\n".join(green_patterns_lines(greens_map))
-        yellow_lines = "\n".join(yellow_patterns_lines(yellows_np))
-        greens_section = "Greens:\n" + ("\n".join(f"{ch.upper()} → position {i+1}" for i, ch in sorted(greens_map.items())) if greens_map else "—")
-        yellows_section = "Yellows (banned positions):\n" + (
-            "\n".join(f"{ch.upper()} → not at {', '.join(str(i+1) for i in sorted(pos))}" for ch, pos in sorted(yellows_np.items()))
-            if yellows_np else "—"
-        )
-        strict_matches = pattern_matches_strict(greens_map, yellows_np, solver.words)
-        final = (
-            "Info:\nPer-guess breakdown:\n" + viz + "\n\n" +
-            report + "\n\n" +
-            greens_section + "\n" +
-            yellows_section + "\n\n" +
-            green_lines + "\n" +
-            yellow_lines + "\n" +
-            "Matches from words.txt (greens+yellow bans): " + format_matches(strict_matches)
-        )
-        await reply_with_quote(chat, final, src)
-    except Exception as e:
-        try: await step.edit_text(mdev_escape("error"), parse_mode=ParseMode.MARKDOWN_V2)
-        except: pass
-        await reply_with_quote(chat, f"Parse error: {e}", src)
+        await quoted_send(chat, "No matches.", src)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -355,7 +355,9 @@ def main():
     global solver
     if not TOKEN:
         raise SystemExit("Set BOT_TOKEN")
-    solver = WordleSolver.from_file(WORDLIST_PATH)
+    # Load initial
+    path = abs_path(WORDLIST_PATH)
+    solver = WordleSolver.from_file(path)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -363,6 +365,7 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
+    app.add_handler(CommandHandler("wstats", wstats_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
     app.add_handler(CommandHandler("inf", inf_cmd))
     app.add_handler(CommandHandler("info", inf_cmd))
@@ -392,4 +395,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
