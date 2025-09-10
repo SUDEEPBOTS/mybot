@@ -461,117 +461,169 @@ async def chack_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q: return
+    if not q:
+        return
+
     data = q.data or ""
     key = (q.message.chat_id, q.message.message_id)
     state = SESSION.get(key)
 
-if data.startswith("copy:"):
+    # Copy best
+    if data.startswith("copy:"):
         parts = data.split(":", 1)
         if len(parts) == 2 and parts:
             await q.answer()
             await q.message.reply_text(mdev_escape(f"`{parts}`"), parse_mode=ParseMode.MARKDOWN_V2)
             return
-        await q.answer("Bad data"); return
+        await q.answer("Bad data")
+        return
 
+    # Pagination for .db analysis list
     if data.startswith("pg:") and state:
-        try: page = int(data.split(":", 1))
-        except: await q.answer("Invalid page"); return
-        ranked = state["ranked"]; best = state["best"]; total = len(ranked)
-        start = max(0, page * PAGE_SIZE); end = min(start + PAGE_SIZE, total)
-        if start >= total: await q.answer("No more pages"); return
+        try:
+            page = int(data.split(":", 1))
+        except:
+            await q.answer("Invalid page")
+            return
+        ranked = state.get("ranked", [])
+        best = state.get("best", "")
+        total = len(ranked)
+        start = max(0, page * PAGE_SIZE)
+        end = min(start + PAGE_SIZE, total)
+        if start >= total:
+            await q.answer("No more pages")
+            return
         state["page"] = page
         top_list = "\n".join(f"{i+1}. {w} ({sc})" for i, (w, sc) in enumerate(ranked[start:end], start=start))
         text = q.message.text or ""
-        new_msg = text.split("Top suggestions") + f"Top suggestions \\(page {page+1}\\):\n{top_list}"
-        await q.edit_message_text(mdev_escape(new_msg), parse_mode=ParseMode.MARKDOWN_V2,
-                                  reply_markup=build_keyboard(best, page, end < total, page > 0))
-        await q.answer(); return
+        base = text.split("Top suggestions")
+        new_msg = base + f"Top suggestions \\(page {page+1}\\):\n{top_list}"
+        await q.edit_message_text(
+            mdev_escape(new_msg),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=build_keyboard(best, page, end < total, page > 0)
+        )
+        await q.answer()
+        return
 
+    # Find-mode chooser buttons
     if data.startswith("findmode:"):
-        _, chosen = data.split(":", 1)
-        state = SESSION.get((q.message.chat_id, q.message.message_id))
-        if not state or state.get("mode") != "find-choose":
-            await q.answer("Session expired"); return
-        qtype = state["query_type"]
-        qvalue = state["query_value"]
-        yellows_np = state.get("yellows_np", {})
-        title = state.get("title", "Find results")
+        _, chosen = data.split(":", 1)  # "smart" or "normal"
+        st = SESSION.get((q.message.chat_id, q.message.message_id))
+        if not st or st.get("mode") != "find-choose":
+            await q.answer("Session expired")
+            return
 
-if qtype == "letter":
-            base = filter_by_letter(qvalue, solver.words)
+        qtype = st["query_type"]          # "letter" | "pattern"
+        qvalue = st["query_value"]
+        yellows_np = st.get("yellows_np", {})
+        title = st.get("title", "Find results")
+
+        if qtype == "letter":
+            base = filter_by_letter(qvalue, solver.words)  # list[str]
             if chosen == "smart":
-                ranked = solver.rank_words(base)
-                state["find_smart_ranked"] = ranked
+                ranked = solver.rank_words(base)           # list[(w,score)]
+                st["find_smart_ranked"] = ranked
                 page = 0
                 text, has_next, has_prev = render_ranked_list(ranked, page, f"Smart find — {title}")
                 kb = make_find_keyboard_with_ns(page, has_next, has_prev, "smart")
                 await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-                state["mode"] = "find-smart"; state["page"] = page
+                st["mode"] = "find-smart"
+                st["page"] = page
             else:
                 items = sorted(base)
-                state["find_normal_items"] = items
+                st["find_normal_items"] = items
                 page = 0
                 text, has_next, has_prev = render_find_list(items, page, f"Find words — {title}")
                 kb = make_find_keyboard_with_ns(page, has_next, has_prev, "normal")
                 await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-                state["mode"] = "find-normal"; state["page"] = page
+                st["mode"] = "find-normal"
+                st["page"] = page
         else:
             base = filter_by_pattern_and_yellows(qvalue, yellows_np, solver.words)
             if chosen == "smart":
                 ranked = solver.rank_words(base)
-                state["find_smart_ranked"] = ranked
+                st["find_smart_ranked"] = ranked
                 page = 0
                 text, has_next, has_prev = render_ranked_list(ranked, page, f"Smart find — {title}")
                 kb = make_find_keyboard_with_ns(page, has_next, has_prev, "smart")
                 await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-                state["mode"] = "find-smart"; state["page"] = page
+                st["mode"] = "find-smart"
+                st["page"] = page
             else:
                 items = sorted(base)
-                state["find_normal_items"] = items
+                st["find_normal_items"] = items
                 page = 0
                 text, has_next, has_prev = render_find_list(items, page, f"Find words — {title}")
                 kb = make_find_keyboard_with_ns(page, has_next, has_prev, "normal")
                 await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-                state["mode"] = "find-normal"; state["page"] = page
-        await q.answer(); return
+                st["mode"] = "find-normal"
+                st["page"] = page
 
+        await q.answer()
+        return
+
+    # Pagination for .find lists
     if data.startswith("findpg:"):
-        parts = data.split(":", 2)
+        parts = data.split(":", 2)  # findpg:<mode_tag>:<page>
         if len(parts) != 3:
-            await q.answer("Bad page"); return
+            await q.answer("Bad page")
+            return
         _, mode_tag, page_str = parts
-        try: page = int(page_str)
-        except: await q.answer("Invalid page"); return
+        try:
+            page = int(page_str)
+        except:
+            await q.answer("Invalid page")
+            return
+
         st = SESSION.get((q.message.chat_id, q.message.message_id))
         if not st or not st.get("mode", "").startswith("find-"):
-            await q.answer("Session expired"); return
+            await q.answer("Session expired")
+            return
+
         title = st.get("title", "Find results")
         if mode_tag == "smart" and st["mode"] == "find-smart":
             ranked = st.get("find_smart_ranked", [])
             text, has_next, has_prev = render_ranked_list(ranked, page, f"Smart find — {title}")
             kb = make_find_keyboard_with_ns(page, has_next, has_prev, "smart")
             await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-            st["page"] = page; await q.answer(); return
+            st["page"] = page
+            await q.answer()
+            return
+
         if mode_tag == "normal" and st["mode"] == "find-normal":
             items = st.get("find_normal_items", [])
             if items and isinstance(items, tuple):
-                items = [w for w, _ in items]; st["find_normal_items"] = items
+                items = [w for w, _ in items]
+                st["find_normal_items"] = items
             text, has_next, has_prev = render_find_list(items, page, f"Find words — {title}")
             kb = make_find_keyboard_with_ns(page, has_next, has_prev, "normal")
             await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-            st["page"] = page; await q.answer(); return
+            st["page"] = page
+            await q.answer()
+            return
 
+    # Refresh analysis block
     if data == "refresh" and state:
-        page = state["page"]; ranked = state["ranked"]; best = state["best"]; total = len(ranked)
-        start = page * PAGE_SIZE; end = min(start + PAGE_SIZE, total)
+        page = state["page"]
+        ranked = state["ranked"]
+        best = state["best"]
+        total = len(ranked)
+        start = page * PAGE_SIZE
+        end = min(start + PAGE_SIZE, total)
         top_list = "\n".join(f"{i+1}. {w} ({sc})" for i, (w, sc) in enumerate(ranked[start:end], start=start))
         text = q.message.text or ""
-        new_msg = text.split("Top suggestions") + f"Top suggestions \\(page {page+1}\\):\n{top_list}"
-        await q.edit_message_text(mdev_escape(new_msg), parse_mode=ParseMode.MARKDOWN_V2,
-                                  reply_markup=build_keyboard(best, page, end < total, page > 0))
-        await q.answer("Refreshed"); return
+        base = text.split("Top suggestions")
+        new_msg = base + f"Top suggestions \\(page {page+1}\\):\n{top_list}"
+        await q.edit_message_text(
+            mdev_escape(new_msg),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=build_keyboard(best, page, end < total, page > 0)
+        )
+        await q.answer("Refreshed")
+        return
 
+    # Default
     await q.answer()
 
 async def find_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
