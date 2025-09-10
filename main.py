@@ -29,19 +29,19 @@ HELP = (
 )
 
 def build_keyboard(best_word: str, page: int, has_next: bool, has_prev: bool):
-    buttons = []
+    rows = []
     nav = []
     if has_prev:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pg:{page-1}"))
     if has_next:
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pg:{page+1}"))
     if nav:
-        buttons.append(nav)
-    buttons.append([
+        rows.append(nav)
+    rows.append([
         InlineKeyboardButton("📋 Copy Best", callback_data=f"copy:{best_word}"),
         InlineKeyboardButton("🔁 Refresh", callback_data="refresh")
     ])
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(rows)
 
 async def safe_delete_message(update: Update):
     try:
@@ -51,8 +51,7 @@ async def safe_delete_message(update: Update):
         pass
 
 def abs_path(p: str) -> str:
-    if os.path.isabs(p):
-        return p
+    if os.path.isabs(p): return p
     return str((pathlib.Path(__file__).parent / p).resolve())
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -64,14 +63,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global solver
     path = abs_path(WORDLIST_PATH)
-    try:
-        solver = WordleSolver.from_file(path)
-        await update.message.reply_text(mdev_escape(f"Reloaded {len(solver.words)} words from {path}."), parse_mode=ParseMode.MARKDOWN_V2)
-    except FileNotFoundError:
-        await update.message.reply_text(mdev_escape(f"words.txt not found at {path}"), parse_mode=ParseMode.MARKDOWN_V2)
+    solver = WordleSolver.from_file(path)
+    await update.message.reply_text(mdev_escape(f"Reloaded {len(solver.words)} words from {path}."), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def wstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Diagnostic: show total words and 5-letter coverage vs raw lines
     path = abs_path(WORDLIST_PATH)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -84,7 +79,7 @@ async def wstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(mdev_escape(f"wstats error: {e}"), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ranked = solver.rank_words(solver.words)[:20]
+    ranked = solver.rank_words(solver.words)[:20]            # input list[str], output list[(w,score)]
     lines = "\n".join(f"{i+1}. {w} ({sc})" for i, (w, sc) in enumerate(ranked))
     await update.message.reply_text(mdev_escape("Top starters:\n" + lines), parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -127,6 +122,56 @@ async def quoted_send(chat, text, src_msg=None):
             rp = None
     return await chat.send_message(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2, reply_parameters=rp)
 
+# Pagination helpers for .find
+def chunk(items, start, size):
+    end = min(start + size, len(items))
+    return items[start:end], end < len(items), start > 0
+
+def make_find_keyboard(page, has_next, has_prev):
+    rows = []
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"findpg:{page-1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"findpg:{page+1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+def render_find_list(items, page, title):
+    start = page * PAGE_SIZE
+    view, has_next, has_prev = chunk(items, start, PAGE_SIZE)
+    body = "\n".join(f"{i+1}. {w}" for i, w in enumerate(view, start=start))
+    head = f"{title} (page {page+1})"
+    return head + "\n" + body, has_next, has_prev
+
+def parse_pattern_or_letter(args: list[str]) -> tuple[str, str]:
+    if not args: return ("", "")
+    raw = " ".join(args).strip().lower()
+    if len(raw) == 1 and raw.isalpha():
+        return ("letter", raw)
+    if " " in raw:
+        parts = raw.split()
+        if len(parts) == 5 and all(len(p) == 1 for p in parts):
+            patt = " ".join(p if p.isalpha() else "_" for p in parts)
+            return ("pattern", patt)
+        return ("", "")
+    if len(raw) == 5:
+        patt = " ".join(ch if ch.isalpha() else "_" for ch in raw)
+        return ("pattern", patt)
+    return ("", "")
+
+def filter_by_letter(letter: str, wordlist: list[str]) -> list[str]:
+    letter = letter.lower()
+    return [w for w in wordlist if letter in w]
+
+def filter_by_pattern_and_yellows(pattern_str: str, yellows_np: dict, wordlist: list[str]) -> list[str]:
+    parts = pattern_str.split()
+    if len(parts) != 5:
+        return []
+    greens = {i: p for i, p in enumerate(parts) if p != "_"}
+    return pattern_matches_strict(greens, yellows_np, wordlist)
+
 async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update)
     chat = update.effective_chat
@@ -141,7 +186,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await scan.edit_text(mdev_escape("done"), parse_mode=ParseMode.MARKDOWN_V2)
 
         result = solver.solve(pairs)
-        cands = result["candidates"]
+        cands = result["candidates"]                      # list[str]
         greens_map = result["greens"]
         yellows_np = result["yellows_not_pos"]
 
@@ -167,7 +212,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await quoted_send(chat, msg, src)
             return
 
-        ranked = solver.rank_words(cands)
+        ranked = solver.rank_words(cands)                 # list[(w,score)]
         best = ranked
         pattern = build_pattern_string(result)
         greens = ", ".join([f"{i+1}:{ch}" for i, ch in sorted(greens_map.items())]) or "-"
@@ -175,7 +220,7 @@ async def dot_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         minc = ", ".join([f"{l}:{v}" for l, v in sorted(result["min_counts"].items())]) or "-"
         maxc = ", ".join([f"{l}:{v}" for l, v in sorted(result["max_counts"].items())]) or "-"
         grays = deduce_grays_display(pairs)
-        strict_matches = pattern_matches_strict(greens_map, yellows_np, cands)
+        strict_matches = pattern_matches_strict(greens_map, yellows_np, cands)  # list[str]
 
         page = 0
         total = len(ranked)
@@ -270,30 +315,15 @@ async def yl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await quoted_send(chat, f"Parse error: {e}", src)
 
-def parse_pattern_arg(args: list[str]) -> str:
-    if not args: return ""
-    raw = " ".join(args).strip()
-    if " " in raw:
-        parts = raw.split()
-        if len(parts) == 5:
-            return " ".join(p.lower() for p in parts)
-        return ""
-    if len(raw) == 5:
-        return " ".join(ch.lower() for ch in raw)
-    return ""
-
-def filter_by_pattern_and_yellows(pattern_str: str, yellows_np: dict, wordlist: list[str]) -> list[str]:
-    parts = pattern_str.split()
-    if len(parts) != 5:
-        return []
-    greens = {i: p for i, p in enumerate(parts) if p != "_"}
-    return pattern_matches_strict(greens, yellows_np, wordlist)
+def parse_pattern_or_letter_args(args):
+    return parse_pattern_or_letter(args)
 
 async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update)
     chat = update.effective_chat
     src = update.message.reply_to_message if update.message else None
 
+    # optional yellows for pattern mode
     yellows_np = {}
     if src and src.text:
         try:
@@ -302,17 +332,26 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             yellows_np = {}
 
-    pattern_str = parse_pattern_arg(context.args)
-    if not pattern_str:
-        await quoted_send(chat, "Usage: /.find s t o _ _  OR  /.find sto__", src); return
+    mode, value = parse_pattern_or_letter(context.args)
+    if not mode:
+        usage = "Usage:\n/.find s t o _ _\n/.find sto__\n/.find l  (letter mode)"
+        await quoted_send(chat, usage, src); return
 
-    matches = filter_by_pattern_and_yellows(pattern_str, yellows_np, solver.words)
-    ranked = solver.rank_words(matches)[:3]
-    if ranked:
-        best3 = ", ".join(w for w, _ in ranked)
-        await quoted_send(chat, f"Matches (top 3): {best3}", src)
+    if mode == "letter":
+        items = [w for w, _ in solver.rank_words(filter_by_letter(value, solver.words))]  # list[str]
+        title = f"Words containing '{value}'"
     else:
-        await quoted_send(chat, "No matches.", src)
+        matches = filter_by_pattern_and_yellows(value, yellows_np, solver.words)         # list[str]
+        ranked = solver.rank_words(matches)                                               # list[(w,score)]
+        items = [w for w, _ in ranked] if ranked else []                                  # list[str]
+        title = f"Pattern {value} (+yellow bans)"
+
+    page = 0
+    text, has_next, has_prev = render_find_list(items, page, title)
+    sent = await quoted_send(chat, text, src)
+    SESSION[(sent.chat_id, sent.message_id)] = {"mode":"find", "items": items, "page": page, "title": title}
+    if has_next or has_prev:
+        await sent.edit_reply_markup(make_find_keyboard(page, has_next, has_prev))
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -320,6 +359,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     key = (q.message.chat_id, q.message.message_id)
     state = SESSION.get(key)
+
     if data.startswith("copy:"):
         parts = data.split(":", 1)
         if len(parts) == 2 and parts:
@@ -327,10 +367,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text(mdev_escape(f"`{parts}`"), parse_mode=ParseMode.MARKDOWN_V2)
             return
         await q.answer("Bad data"); return
+
     if data.startswith("pg:") and state:
         try: page = int(data.split(":", 1))
         except: await q.answer("Invalid page"); return
-        ranked = state["ranked"]; best = state["best"]; total = len(ranked)
+        ranked = state["ranked"]                                        # list[(w,score)]
+        best = state["best"]
+        total = len(ranked)
         start = max(0, page * PAGE_SIZE); end = min(start + PAGE_SIZE, total)
         if start >= total: await q.answer("No more pages"); return
         state["page"] = page
@@ -340,6 +383,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(mdev_escape(new_msg), parse_mode=ParseMode.MARKDOWN_V2,
                                   reply_markup=build_keyboard(best, page, end < total, page > 0))
         await q.answer(); return
+
+    if data.startswith("findpg:"):
+        try: page = int(data.split(":", 1))
+        except: await q.answer("Invalid page"); return
+        st = SESSION.get((q.message.chat_id, q.message.message_id))
+        if not st or st.get("mode") != "find":
+            await q.answer("Session expired"); return
+        items = st["items"]
+        if items and isinstance(items, tuple):
+            items = [w for w, _ in items]
+            st["items"] = items
+        title = st["title"]
+        text, has_next, has_prev = render_find_list(items, page, title)
+        await q.edit_message_text(mdev_escape(text), parse_mode=ParseMode.MARKDOWN_V2,
+                                  reply_markup=make_find_keyboard(page, has_next, has_prev))
+        st["page"] = page
+        await q.answer(); return
+
     if data == "refresh" and state:
         page = state["page"]; ranked = state["ranked"]; best = state["best"]; total = len(ranked)
         start = page * PAGE_SIZE; end = min(start + PAGE_SIZE, total)
@@ -349,13 +410,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(mdev_escape(new_msg), parse_mode=ParseMode.MARKDOWN_V2,
                                   reply_markup=build_keyboard(best, page, end < total, page > 0))
         await q.answer("Refreshed"); return
+
     await q.answer()
 
 def main():
     global solver
     if not TOKEN:
         raise SystemExit("Set BOT_TOKEN")
-    # Load initial
     path = abs_path(WORDLIST_PATH)
     solver = WordleSolver.from_file(path)
 
@@ -386,7 +447,8 @@ def main():
         elif t == ".yl":
             await yl_cmd(update, context)
         elif t.startswith(".find"):
-            context.args = t.split()[1:] if len(t.split()) > 1 else []
+            parts = t.split()
+            context.args = parts[1:] if len(parts) > 1 else []
             await find_cmd(update, context)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), dot_router))
 
