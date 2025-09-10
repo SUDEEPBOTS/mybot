@@ -1,40 +1,66 @@
 import re
+import unicodedata
 from collections import Counter, defaultdict
 
 EMOJI_GREEN = "🟩"
 EMOJI_YELLOW = "🟨"
 EMOJI_GRAY = "🟥"  # treat as gray/black
-VALID_FB = {"G","Y","B"}
+VALID_FB = {"G", "Y", "B"}
+ALT_GRAY = {"⬛", "⬜"}  # additional tiles treated as gray
+
+def normalize_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s)
+    for blk in ALT_GRAY:
+        s = s.replace(blk, EMOJI_GRAY)
+    cleaned = []
+    for ch in s:
+        if ch in (EMOJI_GREEN, EMOJI_YELLOW, EMOJI_GRAY):
+            cleaned.append(ch)
+            continue
+        if ch.isalpha() or ch.isspace():
+            cleaned.append(ch)
+        elif ch in "-_'":
+            cleaned.append(" ")
+        else:
+            # drop decorative symbols/punctuation
+            pass
+    return "".join(cleaned)
+
+def strip_to_ascii_letters(word: str) -> str:
+    w = unicodedata.normalize("NFKC", word)
+    w = "".join(ch for ch in w if ch.isalpha())
+    return w.lower()
 
 def parse_line(line):
-    s = line.strip()
+    s = normalize_text(line).strip()
     if not s:
         return None
-    # Emoji + word
-    m = re.match(rf"^([{EMOJI_GREEN}{EMOJI_YELLOW}{EMOJI_GRAY}]{{5}})\s+([A-Za-z]{{5}})$", s)
+    # Emoji tiles + word (allow spaces between tiles)
+    m = re.match(rf"^([{EMOJI_GREEN}{EMOJI_YELLOW}{EMOJI_GRAY}\s]{{5,}})\s+([A-Za-z\s]{{3,}})$", s)
     if m:
-        emojis, word = m.group(1), m.group(2).lower()
-        fb = []
-        for ch in emojis:
-            if ch == EMOJI_GREEN: fb.append("G")
-            elif ch == EMOJI_YELLOW: fb.append("Y")
-            elif ch == EMOJI_GRAY: fb.append("B")
-        return (word, "".join(fb))
-    # GYBBY WORD
+        tiles_raw, word_raw = m.group(1), m.group(2)
+        tiles = [ch for ch in tiles_raw if ch in (EMOJI_GREEN, EMOJI_YELLOW, EMOJI_GRAY)]
+        if len(tiles) == 5:
+            fb = "".join("G" if ch == EMOJI_GREEN else "Y" if ch == EMOJI_YELLOW else "B" for ch in tiles)
+            word = strip_to_ascii_letters(word_raw)
+            if len(word) == 5:
+                return (word, fb)
     toks = s.split()
-    if len(toks) == 2 and len(toks) == 5 and set(toks.upper()).issubset(VALID_FB) and len(toks[23]) == 5:
-        return (toks[23].lower(), toks.upper())
+    # GYBBY WORD
+    if len(toks) >= 2 and len(toks) == 5 and set(toks.upper()).issubset(VALID_FB):
+        word = strip_to_ascii_letters(toks[-1])
+        if len(word) == 5:
+            return (word, toks.upper())
     # G Y B B Y WORD
-    if len(toks) == 6 and all(t.upper() in VALID_FB for t in toks[:5]) and len(toks[15]) == 5:
-        return (toks[15].lower(), "".join(t.upper() for t in toks[:5]))
+    if len(toks) >= 6 and all(t.upper() in VALID_FB for t in toks[:5]):
+        word = strip_to_ascii_letters(toks[17])
+        if len(word) == 5:
+            return (word, "".join(t.upper() for t in toks[:5]))
     return None
 
-def parse_guess_lines(text):
+def extract_guess_pairs_from_text(text):
     pairs = []
     for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
         p = parse_line(raw)
         if p:
             pairs.append(p)
@@ -43,8 +69,8 @@ def parse_guess_lines(text):
     return pairs
 
 def accumulate_constraints(guesses):
-    greens = {}  # pos->char
-    yellows_not_pos = defaultdict(set)  # char->set(pos)
+    greens = {}
+    yellows_not_pos = defaultdict(set)
     global_min = Counter()
     global_max_known = {}
     for word, fb in guesses:
@@ -56,7 +82,6 @@ def accumulate_constraints(guesses):
             elif fl == "Y":
                 yellows_not_pos[ch].add(i)
                 gy_counts[ch] += 1
-        # per-guess upper bounds derived from B when extra copies guessed
         per_guess_max = {}
         gc = Counter(word)
         for l, k in gc.items():
@@ -104,7 +129,7 @@ def freq_score(cands):
 
 class WordleSolver:
     def __init__(self, words):
-        self.words = [w for w in words if len(w)==5 and w.isalpha() and w.islower()]
+        self.words = [w for w in words if len(w) == 5 and w.isalpha() and w.islower()]
 
     @classmethod
     def from_file(cls, path):
@@ -125,5 +150,66 @@ class WordleSolver:
 
     def rank_words(self, words):
         scores = freq_score(words)
-        ranked = sorted(((w, scores[w]) for w in words), key=lambda x: (-x[23], x))
-        return ranked
+        return sorted(((w, scores[w]) for w in words), key=lambda x: (-x[24], x))
+
+def visualize_guess_line(word, fb):
+    # 1:H(B) 2:E(B) 3:A(G) 4:R(Y) 5:T(B)
+    tags = []
+    for i, (ch, f) in enumerate(zip(word.upper(), fb), 1):
+        tags.append(f"{i}:{ch}({f})")
+    return " - " + " ".join(tags)
+
+def build_constraints_report(pairs):
+    greens, ynp, minc, maxc = accumulate_constraints(pairs)
+    g_line = "Greens: " + (", ".join([f"{i+1}:{ch}" for i, ch in sorted(greens.items())]) or "-")
+    y_lines = []
+    for ch, posset in sorted(ynp.items()):
+        y_lines.append(f"{ch}: not at {', '.join(str(i+1) for i in sorted(posset))}")
+    y_block = "Yellows (position bans): " + (", ".join(y_lines) if y_lines else "-")
+    min_line = "Min counts: " + (", ".join([f"{l}:{v}" for l, v in sorted(minc.items())]) or "-")
+    max_line = "Max counts: " + (", ".join([f"{l}:{v}" for l, v in sorted(maxc.items())]) or "-")
+
+    letters_seen = sorted({l for w, fb in pairs for l in set(w)})
+    allowed_lines = []
+    for l in letters_seen:
+        allowed = []
+        for i in range(5):
+            if i in greens and greens[i] != l:
+                continue
+            if l in ynp and i in ynp[l]:
+                continue
+            allowed.append(str(i+1))
+        if allowed:
+            allowed_lines.append(f"{l}: {', '.join(allowed)}")
+    allowed_block = "Allowed positions (by bans): " + (", ".join(allowed_lines) if allowed_lines else "-")
+
+    # Display-only grays
+    seen_g_y, seen_b = set(), set()
+    for w, fb in pairs:
+        for ch, f in zip(w, fb):
+            if f in ("G", "Y"):
+                seen_g_y.add(ch)
+            elif f == "B":
+                seen_b.add(ch)
+    grays = sorted([ch for ch in seen_b if ch not in seen_g_y])
+    gray_line = "Gray-only letters: " + (", ".join(grays).upper() if grays else "-")
+
+    return "\n".join([g_line, y_block, min_line, max_line, allowed_block, gray_line])
+
+def build_pattern_string(result):
+    patt = ["_"] * 5
+    for i, ch in result["greens"].items():
+        patt[i] = ch
+    return " ".join(patt)
+
+def deduce_grays_display(pairs):
+    seen_g_y, seen_b = set(), set()
+    for w, fb in pairs:
+        for ch, f in zip(w, fb):
+            if f in ("G", "Y"):
+                seen_g_y.add(ch)
+            elif f == "B":
+                seen_b.add(ch)
+    grays = sorted([ch for ch in seen_b if ch not in seen_g_y])
+    return ", ".join(grays) if grays else "-"
+                
