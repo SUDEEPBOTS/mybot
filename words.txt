@@ -1,3 +1,5 @@
+sepia
+grout
 thief
 pinto
 riser
