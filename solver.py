@@ -88,37 +88,60 @@ def accumulate_constraints(guesses: List[Tuple[str, str]]):
         gy_counts = Counter()
         for i, (ch, fl) in enumerate(zip(word, fb)):
             if fl == "G":
-                greens[i] = ch; gy_counts[ch] += 1
+                greens[i] = ch
+                gy_counts[ch] += 1
             elif fl == "Y":
-                yellows_not_pos[ch].add(i); gy_counts[ch] += 1
+                yellows_not_pos[ch].add(i)
+                gy_counts[ch] += 1
+                # ✅ Yellow ka matlab: letter must exist somewhere
+                if global_min[ch] < gy_counts[ch]:
+                    global_min[ch] = gy_counts[ch]
+
+        # per-guess maximums (gray handling with duplicates)
         per_guess_max = {}
         gc = Counter(word)
         for l, k in gc.items():
             r = gy_counts[l]
             if r < k:
                 per_guess_max[l] = r
+
+        # update global mins
         for l, r in gy_counts.items():
             if r > global_min[l]:
                 global_min[l] = r
+
+        # update global max-known
         for l, mx in per_guess_max.items():
             global_max_known[l] = min(global_max_known.get(l, mx), mx)
 
     return greens, yellows_not_pos, dict(global_min), global_max_known
-
+    
 def word_satisfies(word, greens, yellows_not_pos, min_counts, max_counts):
+    # ✅ Green exact match
     for i, ch in greens.items():
-        if word[i] != ch: return False
+        if word[i] != ch:
+            return False
+
+    # ✅ Yellow must exist, but not at banned positions
     for ch, banned in yellows_not_pos.items():
-        if ch not in word: return False
+        if ch not in word:
+            return False
         for pos in banned:
-            if word[pos] == ch: return False
+            if word[pos] == ch:
+                return False
+
+    # ✅ Check minimum counts
     wc = Counter(word)
     for l, m in min_counts.items():
-        if wc[l] < m: return False
-    for l, mx in max_counts.items():
-        if wc[l] > mx: return False
-    return True
+        if wc[l] < m:
+            return False
 
+    # ✅ Check maximum counts
+    for l, mx in max_counts.items():
+        if wc[l] > mx:
+            return False
+
+    return True
 def positional_frequencies(words: List[str]):
     pos_freq = [Counter() for _ in range(5)]
     global_freq = Counter()
